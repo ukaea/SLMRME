@@ -1,5 +1,7 @@
 # 📌 Safe Learning for Multi-Robot Mapless Exploration
 
+This is the supplementary material for the paper **Safe Learning for Multi-Robot Mapless Exploration**. 
+
 This Python project uses **Deep Reinforcement Learning (DRL)** to train a **TurtleBot3 Waffle Pi** for autonomous navigation **without relying on pre-built maps**. The training enables the robot to perform **mapless exploration** and **avoid obstacles** in simulated dynamic environments.
 
 Built within the **Robot Operating System (ROS)** framework, this implementation leverages **Gazebo** for realistic simulation and **PyTorch** for DRL model development.
