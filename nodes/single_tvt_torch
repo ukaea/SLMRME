@@ -1,0 +1,535 @@
+#!/usr/bin/env python
+"""
+Implementation of Deep Deterministic Policy Gradients (DDPG) for training
+a robot agent in a ROS-based simulation environment using PyTorch.
+Includes components for actor-critic networks, replay buffer, and logging.
+"""
+
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal
+import datetime
+import rospy
+import os
+import json
+import time
+import sys
+
+# Assuming tvt20_bot/nodes is the current directory,
+# this adds tvt20_bot/src to the Python path.
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+
+from std_msgs.msg import Float32MultiArray
+import six_env # Custom environment module
+import random
+from collections import deque
+import scipy.io as sio
+import csv
+import matplotlib.pyplot as plt
+
+
+'''
+Implementation of Deep Deterministic Policy Gradients (DDPG) with pytorch
+Orginal paper: https://arxiv.org/abs/1509.02971
+Not the original author's implementation!
+'''
+
+# --- Global Constants ---
+# Use ALL CAPS for global constants
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+STATE_DIM = 28 # Dimension of the state space
+ACTION_DIM = 2 # Dimension of the action space
+
+
+class Replay_buffer():
+    """
+    A simple replay buffer to store and sample experience tuples.
+    Expects tuples of (state, next_state, action, reward, done).
+    Code based on:
+    https://github.com/openai/baselines/blob/master/baselines/deepq/replay_buffer.py
+    """
+    def __init__(self, max_size=10000):
+        """
+        Initializes the replay buffer.
+        Args:
+            max_size (int): The maximum number of transitions to store.
+        """
+        self.storage = []
+        self.max_size = max_size
+        self.ptr = 0
+
+    def push(self, data):
+        """
+        Adds a new transition to the buffer. Overwrites the oldest
+        transition if the buffer is full.
+        Args:
+            data (tuple): A tuple containing (state, next_state, action, reward, done).
+        """
+        if len(self.storage) == self.max_size:
+            self.storage[int(self.ptr)] = data
+            self.ptr = (self.ptr + 1) % self.max_size
+        else:
+            self.storage.append(data)
+
+    def sample(self, batch_size=512):
+        """
+        Samples a random batch of transitions from the buffer.
+        Args:
+            batch_size (int): The number of transitions to sample.
+        Returns:
+            tuple: A tuple of numpy arrays (states, next_states, actions, rewards, dones).
+        """
+        ind = np.random.randint(0, len(self.storage), size=batch_size)
+        x, y, u, r, d = [], [], [], [], []
+
+        for i in ind:
+            X, Y, U, R, D = self.storage[i]
+            x.append(np.array(X, copy=False))
+            y.append(np.array(Y, copy=False))
+            u.append(np.array(U, copy=False))
+            r.append(np.array(R, copy=False))
+            d.append(np.array(D, copy=False))
+
+        return np.array(x), np.array(y), np.array(u), np.array(r).reshape(-1, 1), np.array(d).reshape(-1, 1)
+
+
+class Logger():
+    """
+    Handles the creation of logging directories based on timestamps
+    for saving experiment data and models.
+    """
+    def __init__(self, logging_directory, timestamp_value):
+        """
+        Initializes the logger and creates the timestamped directory.
+        Args:
+            logging_directory (str): The base path for logging.
+            timestamp_value (datetime): The timestamp object used to create the directory name.
+        """
+        self.timestamp_value = timestamp_value
+        self.base_directory = os.path.join(logging_directory, self.timestamp_value.strftime('%Y-%m-%d.%H:%M:%S'))
+        print('Creating data logging session: %s' % (self.base_directory))
+
+        if not os.path.exists(self.base_directory):
+            os.makedirs(self.base_directory)
+
+
+class Actor(nn.Module):
+    """
+    The Actor network for DDPG. Maps states to actions.
+    Outputs one component through tanh and another through sigmoid.
+    """
+    def __init__(self, state_dim, action_dim):
+        """
+        Initializes the Actor network.
+        Args:
+            state_dim (int): Dimension of the state space.
+            action_dim (int): Dimension of the action space.
+        """
+        super(Actor, self).__init__()
+
+        self.l1 = nn.Linear(state_dim, 500)
+        self.l2 = nn.Linear(500, 500)
+        self.l3 = nn.Linear(500, 500)
+        # Note: This architecture assumes action_dim is 2, splitting the output
+        # into two components (tanh and sigmoid) from a single final layer.
+        # For action_dim=2, this layer has 1 output.
+        self.l4 = nn.Linear(500, action_dim - 1)
+
+
+    def forward(self, x):
+        """
+        Performs a forward pass through the network.
+        Maps a state tensor to an action tensor.
+        Args:
+            x (torch.Tensor): The input state tensor.
+        Returns:
+            torch.Tensor: The output action tensor, with components
+                          passed through tanh and sigmoid activations, concatenated.
+        """
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        x = F.relu(self.l3(x))
+        # Apply tanh and sigmoid to the output of the same layer
+        x_t = F.tanh(self.l4(x))
+        x_s = F.sigmoid(self.l4(x))
+        # Concatenate the two outputs
+        x = torch.cat([x_t, x_s], dim=1)
+        return x
+
+
+class Critic(nn.Module):
+    """
+    The Critic network for DDPG. Approximates the Q-value of a
+    state-action pair.
+    """
+    def __init__(self, state_dim, action_dim):
+        """
+        Initializes the Critic network.
+        Args:
+            state_dim (int): Dimension of the state space.
+            action_dim (int): Dimension of the action space.
+        """
+        super(Critic, self).__init__()
+
+        self.l1 = nn.Linear(state_dim, 500)
+        self.l2 = nn.Linear(500, 250) # State path
+        self.l3 = nn.Linear(action_dim, 500) # Action path
+        self.l4 = nn.Linear(500, 250) # Action path
+
+        # Combined path layers
+        self.l5 = nn.Linear(500, 500) # Input size is 250 (from l2) + 250 (from l4)
+        self.l8 = nn.Linear(500, 500) # This layer is defined but commented out in forward
+
+        self.l6 = nn.Linear(500, 1) # Output Q-value
+
+
+    def forward(self, x, u):
+        """
+        Performs a forward pass through the network.
+        Estimates the Q-value for a given state and action.
+        Args:
+            x (torch.Tensor): The input state tensor.
+            u (torch.Tensor): The input action tensor.
+        Returns:
+            torch.Tensor: The estimated Q-value.
+        """
+        # Process state input
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+
+        # Process action input
+        u = F.relu(self.l3(u))
+        u = self.l4(u)
+
+        # Concatenate state and action features and process
+        xx = torch.cat([x, u], 1)
+        xx = F.relu(self.l5(xx))
+        # xx = F.relu(self.l8(xx)) # This layer is commented out in the forward pass
+        xx = self.l6(xx) # Output Q-value
+        return xx
+
+
+class DDPG(object):
+    """
+    Deep Deterministic Policy Gradient (DDPG) agent implementation.
+    Includes Actor and Critic networks, target networks, replay buffer,
+    and training logic.
+    """
+    def __init__(self, state_dim, action_dim):
+        """
+        Initializes the DDPG agent.
+        Args:
+            state_dim (int): Dimension of the state space.
+            action_dim (int): Dimension of the action space.
+        """
+        self.dirPath = os.path.dirname(os.path.realpath(__file__))
+        # Adjust path to point to the src directory assuming standard ROS package structure
+        self.dirPath = self.dirPath.replace('tvt20_bot/nodes', 'tvt20_bot/src')
+        self.dirPath_backup = self.dirPath # Used for loading
+
+        timestamp = time.time()
+        timestamp_value = datetime.datetime.fromtimestamp(timestamp)
+        logger = Logger(self.dirPath, timestamp_value)
+        self.dirPath = logger.base_directory # Update dirPath to the new timestamped directory
+
+        # Initialize Actor and Critic networks and their targets
+        self.actor = Actor(state_dim, action_dim).to(DEVICE)
+        self.actor_target = Actor(state_dim, action_dim).to(DEVICE)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
+
+        self.critic = Critic(state_dim, action_dim).to(DEVICE)
+        self.critic_target = Critic(state_dim, action_dim).to(DEVICE)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-4)
+
+        # Initialize replay buffer and hyperparameters
+        self.replay_buffer = Replay_buffer()
+        self.epsilon = .9 # Exploration parameter
+        self.epsilon_decay = .99995 # Decay rate for epsilon
+        self.gamma = .90 # Discount factor
+        self.batch_size = 512 # Batch size for training updates
+        self.tau = .01 # Target network update rate (soft update)
+        self.mode = 0 # 0 for training, 1 for testing
+        self.num_trials = 500 # Number of training episodes
+        self.trial_len = 1000 # Maximum steps per episode
+
+        # Training step counters
+        self.num_critic_update_iteration = 0
+        self.num_actor_update_iteration = 0
+        self.num_training = 0
+
+
+    def read_Q_values(self, cur_states, actions):
+        """
+        Reads the Q-values from the critic network for given states and actions.
+        Args:
+            cur_states (np.ndarray): Array of states.
+            actions (np.ndarray): Array of actions.
+        Returns:
+            torch.Tensor: The critic's estimated Q-values.
+        """
+        cur_states = torch.FloatTensor(cur_states).to(DEVICE)
+        actions = torch.FloatTensor(actions).to(DEVICE)
+        critic_values = self.critic(cur_states, actions)
+        return critic_values
+
+    def select_action(self, state):
+        """
+        Selects an action for a given state using the actor network.
+        Note: Exploration noise is added in the main loop, not here.
+        Args:
+            state (np.ndarray): The current state.
+        Returns:
+            np.ndarray: The selected action from the actor network (before exploration).
+        """
+        state = torch.FloatTensor(state.reshape(1, -1)).to(DEVICE)
+        return self.actor(state).cpu().data.numpy().flatten()
+
+    def update(self):
+        """
+        Performs one training step to update the actor and critic networks
+        using a batch sampled from the replay buffer.
+        Updates include:
+        1. Compute target Q-values using the Bellman equation.
+        2. Compute and minimize the Critic loss (MSE).
+        3. Compute and minimize the Actor loss (policy gradient).
+        4. Perform soft updates on the target networks.
+        """
+        # Sample replay buffer
+        x, y, u, r, d = self.replay_buffer.sample(self.batch_size) # Use self.batch_size
+
+        # Convert numpy arrays to PyTorch tensors
+        state = torch.FloatTensor(x).to(DEVICE)
+        action = torch.FloatTensor(u).to(DEVICE)
+        next_state = torch.FloatTensor(y).to(DEVICE)
+        # done is 1-d as per the original code's usage in target_Q calculation
+        done = torch.FloatTensor(1 - d).to(DEVICE)
+        reward = torch.FloatTensor(r).to(DEVICE)
+
+        # --- Critic Update ---
+        # Get current Q estimate
+        current_Q = self.critic(state, action)
+
+        # Compute the target Q value
+        # Target Q = reward + gamma * Q_target(next_state, actor_target(next_state))
+        # where done is 0 for terminal states (so gamma * Q_target term is zeroed out)
+        target_Q = self.critic_target(next_state, self.actor_target(next_state))
+        target_Q = reward + (done * self.gamma * target_Q).detach() # Detach target from graph
+
+        # Compute critic loss (Mean Squared Error)
+        critic_loss = F.mse_loss(current_Q, target_Q)
+
+        # Optimize the critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # --- Actor Update ---
+        # Compute actor loss (Maximize Q-value output for actor's chosen action)
+        actor_loss = -self.critic(state, self.actor(state)).mean()
+
+        # Optimize the actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # --- Target Network Update (Soft Update) ---
+        # target = tau * local + (1 - tau) * target
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        # Increment update counters
+        self.num_actor_update_iteration += 1
+        self.num_critic_update_iteration += 1
+        # self.num_training += 1 # This counter isn't used inside update but could be incremented here
+
+    def save(self, ii):
+        """
+        Saves the current state dictionaries of the actor and critic models.
+        Files are named using the trial index and trial length within the
+        timestamped directory.
+        Args:
+            ii (int): An index or identifier for the save file name (e.g., episode number).
+        """
+        actor_save_path = os.path.join(self.dirPath, f'actor-{ii}-{self.trial_len}.pth')
+        critic_save_path = os.path.join(self.dirPath, f'critic-{ii}-{self.trial_len}.pth')
+        torch.save(self.actor.state_dict(), actor_save_path)
+        torch.save(self.critic.state_dict(), critic_save_path)
+        print("====================================")
+        print(f"Model has been saved to {self.dirPath} (Trial {ii})")
+        print("====================================")
+
+    def load(self):
+        """
+        Loads the state dictionaries for the actor and critic models
+        from predefined file paths within the backup directory.
+        Note: Hardcoded trial number (300) is used for loading.
+        """
+        # Hardcoded load path - might need adjustment depending on user need
+        actor_load_path = os.path.join(self.dirPath_backup, f'actor-{300}-{self.trial_len}.pth')
+        critic_load_path = os.path.join(self.dirPath_backup, f'critic-{300}-{self.trial_len}.pth')
+
+        if not os.path.exists(actor_load_path) or not os.path.exists(critic_load_path):
+            print(f"Warning: Model files not found at {self.dirPath_backup}. Cannot load.")
+            # Optionally raise an error or handle gracefully
+            return
+
+        self.actor.load_state_dict(torch.load(actor_load_path, map_location=DEVICE))
+        self.critic.load_state_dict(torch.load(critic_load_path, map_location=DEVICE))
+        print("====================================")
+        print(f"Model has been loaded from {self.dirPath_backup} (Trial 300)")
+        print("====================================")
+
+
+if __name__ == '__main__':
+    """
+    Main execution block for the DDPG agent training and testing.
+    Initializes the ROS node, environment, and DDPG agent, then
+    runs either a training loop (mode 0) or a testing loop (mode 1).
+    """
+    # Initialize ROS node
+    rospy.init_node('single_tvt_torch')
+
+    # Create DDPG agent instance
+    agent = DDPG(STATE_DIM, ACTION_DIM) # Use global constants
+
+    # Initialize environment
+    env = six_env.GameState(3) # Assuming '3' is a necessary environment parameter
+
+    # Initialize counters and variables
+    step = 0
+    ep_r = 0 # Episode reward for testing mode
+
+    # --- Testing Mode (mode == 1) ---
+    if agent.mode == 1:
+        print("Running in Testing Mode...")
+        agent.load() # Load pre-trained model
+        current_state = env.reset()
+        current_state = np.reshape(current_state, (1, STATE_DIM)) # Use global constant
+
+        for t in range(agent.trial_len):
+            # Select action using the trained actor (no exploration)
+            action = agent.select_action(current_state[0])
+
+            # Take a step in the environment
+            # Assuming game_step takes dt, action_linear, action_angular
+            # The order action[1], action[0] suggests action[1] is linear and action[0] is angular
+            reward, new_state, done = env.game_step(0.1, action[1], action[0])
+            ep_r += reward
+
+            # Check for episode termination
+            if done or t >= agent.trial_len - 1: # Check if max steps reached
+                print(f"Test Episode: {1}, Steps: {t+1}, Episode Reward: {ep_r:0.2f}")
+                ep_r = 0 # Reset episode reward for next potential episode (though only one is run here)
+                # If env doesn't auto-reset on done, might need env.reset() here if running multiple test episodes
+                if done:
+                    print("Episode finished due to 'done' signal.")
+                break # Exit loop after one test episode
+
+            current_state = new_state # Update state
+
+    # --- Training Mode (mode == 0) ---
+    elif agent.mode == 0:
+        print("Running in Training Mode...")
+        step_reward = [] # List to store [step, reward] pairs for logging
+        step_Q = [] # List to store [step, Q_value] pairs for logging
+
+        for i in range(agent.num_trials): # Loop over episodes
+            total_reward = 0 # Reset total reward for the episode
+            current_state = env.reset() # Reset environment for a new episode
+            current_state = np.reshape(current_state, (1, STATE_DIM)) # Use global constant
+
+            for t in range(agent.trial_len): # Loop over steps in an episode
+                step = step + 1 # Increment total training steps
+                print(f'Step: {step}, Episode: {i+1}')
+
+                # Apply epsilon decay
+                agent.epsilon *= agent.epsilon_decay
+
+                # Select action from actor
+                action = agent.select_action(current_state[0])
+
+                # Apply exploration noise (Ornstein-Uhlenbeck or simple random noise)
+                # This implementation uses simple uniform random noise with epsilon probability
+                test = np.random.random()
+                if test < agent.epsilon:
+                    # Add noise to actions. The bounds (-0.5, 0.5) and (0.3, 1) seem hardcoded
+                    # based on environment constraints or expected action ranges.
+                    action[0] = action[0] + (np.random.random()-0.5) * 0.4
+                    action[1] = action[1] + (np.random.random()-0.5) * 0.4
+
+                    # Clamp actions to predefined ranges
+                    action[0] = np.clip(action[0], -0.5, 0.5) # Clamp angular velocity
+                    action[1] = np.clip(action[1], 0.3, 1.0) # Clamp linear velocity scale
+
+                else:
+                    # Use action directly from actor (no noise)
+                    action[0] = action[0]
+                    action[1] = action[1]
+
+                # Take a step in the environment
+                # Assuming game_step takes dt, action_linear, action_angular
+                reward, new_state, done = env.game_step(0.1, action[1], action[0]) # Note action order again
+                print(f'###### Step Reward: {reward:0.4f}')
+
+                # Log step reward
+                step_reward.append([step, reward]) # Use append for list
+
+                # Read and log Q-values for the current state-action pair
+                Q_values = agent.read_Q_values(current_state, np.reshape(action, (1, ACTION_DIM))) # Use global constant
+                temp_Q = Q_values.cpu().data.numpy().flatten()
+                step_Q.append([step, temp_Q[0]]) # Use append for list
+
+                # Save logs periodically
+                # Consider saving less frequently for large runs
+                if step % 100 == 0: # Example: Save logs every 100 steps
+                    try:
+                        # Convert lists to numpy arrays before saving with sio.savemat
+                        sio.savemat(os.path.join(agent.dirPath, 'step_reward.mat'),{'data':np.array(step_reward)}, True)
+                        sio.savemat(os.path.join(agent.dirPath, 'step_Q.mat'),{'data':np.array(step_Q)}, True)
+                        print(f"Saved logs at step {step}")
+                    except Exception as e:
+                        print(f"Error saving logs: {e}")
+
+
+                # Perform agent update
+                # Update only after buffer has enough samples (e.g., > batch_size)
+                # and every few steps (e.g., every 5 steps as in original code)
+                # The condition `step > 512 and step % 5 == 0` means update starts after 512 steps
+                # and runs every 5 steps thereafter.
+                if step > agent.batch_size and step % 5 == 0: # Use self.batch_size
+                    print('Performing DDPG update...')
+                    agent.update()
+
+                # Mark done if max steps reached for the episode
+                if t == agent.trial_len - 1: # Use agent.trial_len
+                    done = True
+
+                # Store transition in the replay buffer
+                agent.replay_buffer.push((current_state[0], new_state[0], action, reward, float(done)))
+
+                # Update current state for the next step
+                current_state = new_state
+
+                # Accumulate total reward for the episode
+                total_reward += reward
+
+            # Print episode summary
+            print(f"Total Steps: {step}, Episode: {i+1}, Total Episode Reward: {total_reward:0.2f}")
+
+            # Save model weights periodically
+            if (i + 1) % 5 == 0: # Save every 5 episodes (+1 because i is 0-indexed)
+                agent.save(i + 1) # Save using episode number (1-indexed)
+
+    # --- Handle Invalid Mode ---
+    else:
+        raise NameError("Invalid mode! agent.mode must be 0 for training or 1 for testing.")
