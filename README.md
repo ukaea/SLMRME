@@ -10,7 +10,10 @@ Built within the **Robot Operating System (ROS)** framework, this implementation
 
 
 ## 🧠 Multi-Robot Exploration Demo
-<p align="center"> <img src="Sim.gif" width="30%" /> <img src="Real.gif" width="30%" /> </p>
+<p align="center">
+  <img src="Sim.gif" width="30%" />&nbsp;&nbsp;&nbsp&nbsp;&nbsp;&nbsp&nbsp;&nbsp;&nbsp;
+  <img src="Real.gif" width="30%" />
+</p>
 
 
 ---
