@@ -8,6 +8,13 @@ Built within the **Robot Operating System (ROS)** framework, this implementation
 
 ---
 
+
+## 🧠 Multi-Robot Exploration Demo
+<p align="center"> <img src="Sim.gif" width="30%" /> <img src="Real.gif" width="30%" /> </p>
+
+
+---
+
 ## 📖 Getting Started
 
 These instructions will help you get the project running on your local machine for development and testing.
