@@ -62,7 +62,7 @@ catkin_make
 
 ```bash
 cd ~/catkin_ws/src/
-git clone https://git.ccfe.ac.uk/ld6972/safe-learning-for-multi-robot-mapless-exploration2.git
+git clone https://github.com/ukaea/SLMRME.git
 ```
 
 ---
